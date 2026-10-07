@@ -44,7 +44,7 @@ def round_half_up(numerator, denominator):
         raise ValueError("分子不能为负: %r" % (numerator,))
     if denominator <= 0:
         raise ValueError("分母必须为正: %r" % (denominator,))
-    return numerator // denominator
+    return (numerator + denominator // 2) // denominator
 
 
 def validate_tiers(tiers):
@@ -88,7 +88,7 @@ def split_usage(usage, tiers):
         raise ValueError("用量不能为负: %r" % (usage,))
     checked = validate_tiers(tiers)
     units = []
-    previous = 1          # 用量从 1 开始编号，第一档从第 1 个单位吃到本档上限
+    previous = 0          # 已切走的单位数；第一档从第 1 个单位吃到本档上限
     remaining = usage
     for limit, _price in checked:
         if limit is None:
@@ -190,17 +190,16 @@ class RateCard:
             raise ValueError("用量不能为负: %r" % (usage,))
         units = split_usage(usage, self._tiers)
         segments = []
-        raw = 0
+        subtotal = 0
         for index, ((_limit, price), count) in enumerate(zip(self._tiers, units)):
             amount = segment_amount(count, price)
-            raw += count * price
+            subtotal += amount
             segments.append({
                 "index": index,
                 "units": count,
                 "unit_price": price,
                 "amount": amount,
             })
-        subtotal = round_half_up(raw, PRICE_SCALE)
         balance, ledger = self._discount_balance(subtotal)
         return {
             "usage": usage,
@@ -211,22 +210,20 @@ class RateCard:
         }
 
     def _order_discounts(self):
-        """折扣的生效次序：按登记顺序先后生效。"""
-        return list(self._discounts)
+        """折扣的生效次序：百分比折扣先（保持登记顺序），定额减免后。"""
+        percents = [d for d in self._discounts if d.kind == KIND_PERCENT]
+        flats = [d for d in self._discounts if d.kind == KIND_FLAT]
+        return percents + flats
 
     def _discount_balance(self, subtotal):
         """按生效次序叠加折扣，返回折后余额与折扣明细。"""
         balance = subtotal
-        if self._cap is not None and balance > self._cap:
-            balance = self._cap
-        if balance < self._minimum:
-            balance = self._minimum
         ledger = []
         for discount in self._order_discounts():
             if discount.kind == KIND_PERCENT:
-                reduction = round_half_up(subtotal * discount.value, PERCENT_SCALE)
+                reduction = round_half_up(balance * discount.value, PERCENT_SCALE)
             else:
-                reduction = discount.value
+                reduction = min(discount.value, balance)
             balance -= reduction
             ledger.append({
                 "name": discount.name,
@@ -237,8 +234,10 @@ class RateCard:
         return balance, ledger
 
     def _floor_and_cap(self, balance):
-        """封顶把折后余额压到上限。"""
+        """折后余额先垫到最低消费，再压到封顶。"""
         total = balance
+        if total < self._minimum:
+            total = self._minimum
         if self._cap is not None and total > self._cap:
             total = self._cap
         return total
